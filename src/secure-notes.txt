@@ -1,7 +1,1 @@
-This branch will contain secure implementations:
-- Parameterized queries
-- CSRF protection
-- Secure session handling
-- Security headers
-- Password hashing
-- Input validation
+This branch will contain secure code with mitigations.
