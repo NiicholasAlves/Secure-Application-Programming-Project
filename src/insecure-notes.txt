@@ -1,0 +1,4 @@
+This branch will contain intentionally insecure code:
+- SQL Injection
+- Stored, Reflected and DOM XSS
+- Sensitive Data Exposure
