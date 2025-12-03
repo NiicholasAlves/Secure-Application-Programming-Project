@@ -100,3 +100,64 @@ app.get('/logout', (req, res) => {
 app.listen(PORT, () => {
   console.log(`Insecure app listening on http://localhost:${PORT}`);
 });
+
+// View all posts (Stored XSS will appear here)
+app.get('/posts', (req, res) => {
+  db.all(`SELECT * FROM posts ORDER BY created_at DESC`, (err, posts) => {
+    if (err) return res.send("Database error");
+
+    let html = `<h1>Insecure Posts</h1>`;
+
+    if (currentUser) {
+      html += `
+        <p><a href="/create-post">Create New Post</a></p>
+        <p>Logged in as: ${currentUser.name} <a href="/logout">Logout</a></p>
+      `;
+    } else {
+      html += `<p><a href="/login">Login first</a></p>`;
+    }
+
+    posts.forEach(post => {
+      html += `
+        <div style="border:1px solid black; padding:10px; margin:10px;">
+          <h3>${post.title}</h3>
+          <p>${post.content}</p> <!-- Stored XSS shows here -->
+        </div>
+      `;
+    });
+
+    res.send(html);
+  });
+});
+
+// Create post form
+app.get('/create-post', (req, res) => {
+  if (!currentUser) return res.redirect('/login');
+
+  res.send(`
+    <h1>Create Post</h1>
+    <form method="POST" action="/create-post">
+      <input type="text" name="title" placeholder="Title"><br><br>
+      <textarea name="content" placeholder="Content"></textarea><br><br>
+      <button type="submit">Submit</button>
+    </form>
+    <p>⚠️ Try a Stored XSS attack!</p>
+    <p><a href="/posts">Back to posts</a></p>
+  `);
+});
+
+// INSECURE: Stored XSS vulnerability here!
+app.post('/create-post', (req, res) => {
+  if (!currentUser) return res.redirect('/login');
+
+  const { title, content } = req.body;
+
+  const query = `
+    INSERT INTO posts (user_id, title, content)
+    VALUES (${currentUser.id}, '${title}', '${content}')
+  `;
+
+  db.run(query, () => {
+    res.redirect('/posts');
+  });
+});
