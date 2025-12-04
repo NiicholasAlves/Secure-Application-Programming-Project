@@ -1,204 +1,218 @@
 // src/server.js
-// INSECURE Express server – contains SQL Injection and XSS vulnerabilities
+// SECURE Express server – mitigates SQL Injection, XSS and Sensitive Data Exposure
 
 const express = require('express');
 const path = require('path');
-const db = require('./db');
+const session = require('express-session');
+const helmet = require('helmet');
+const csrf = require('csurf');
+const bcrypt = require('bcrypt');
+const db = require('./secure-db');
 
 const app = express();
 const PORT = 3000;
 
-// Middleware to parse form data
+// Middleware
 app.use(express.urlencoded({ extended: true }));
+app.use(helmet()); // basic security headers
 
-// Very basic "session" using a global variable (INSECURE)
-let currentUser = null;
+// Proper session management
+app.use(session({
+  secret: 'change-this-secret-in-real-app', // in real apps, keep this in env variable
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true, // helps prevent XSS stealing cookie
+    // secure: true, // would be used in HTTPS
+    maxAge: 60 * 60 * 1000 // 1 hour
+  }
+}));
+
+// CSRF protection
+const csrfProtection = csrf();
+app.use(csrfProtection);
+
+// Helper: escape HTML to prevent XSS
+function escapeHtml(str) {
+  if (!str) return '';
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Middleware to make user available in templates
+app.use((req, res, next) => {
+  res.locals.currentUser = req.session.user || null;
+  next();
+});
 
 // Home page
 app.get('/', (req, res) => {
+  const user = res.locals.currentUser;
   let html = `
-    <h1>Insecure Blog - Insecure Branch</h1>
-    ${currentUser ? `<p>Logged in as: ${currentUser.name} (${currentUser.email})</p>` : '<p>Not logged in</p>'}
+    <h1>Secure Blog - Secure Branch</h1>
+    ${user ? `<p>Logged in as: ${escapeHtml(user.name)} (${escapeHtml(user.email)})</p>` : '<p>Not logged in</p>'}
     <p><a href="/login">Login</a></p>
     <p><a href="/posts">View Posts</a></p>
-    <p><a href="/init-db">Initialize DB (for demo)</a></p>
   `;
   res.send(html);
 });
 
-// Initialise DB route (for demo only - INSECURE to expose this)
-app.get('/init-db', (req, res) => {
-  res.send(`
-    <h2>Database initialised</h2>
-    <p>Admin user: admin@example.com / password123</p>
-    <p><a href="/login">Go to login</a></p>
-  `);
-});
-
-// Login form
+// Login form (includes CSRF token)
 app.get('/login', (req, res) => {
+  const token = req.csrfToken();
   const html = `
-    <h1>Login (Insecure)</h1>
+    <h1>Login (Secure)</h1>
     <form method="POST" action="/login">
+      <input type="hidden" name="_csrf" value="${token}">
       <label>Email:</label><br>
       <input type="text" name="email"><br><br>
       <label>Password:</label><br>
       <input type="password" name="password"><br><br>
       <button type="submit">Login</button>
     </form>
-    <p>Try normal login or SQL injection such as:</p>
-    <pre>' OR '1'='1</pre>
     <p><a href="/">Back to home</a></p>
   `;
   res.send(html);
 });
 
-// INSECURE LOGIN: vulnerable to SQL injection
+// SECURE LOGIN: parameterised query + bcrypt
 app.post('/login', (req, res) => {
   const { email, password } = req.body;
 
-  // 🚨 INTENTIONALLY INSECURE: builds SQL string by concatenating user input
-  const insecureQuery = `
-    SELECT * FROM users
-    WHERE email = '${email}'
-      AND password = '${password}'
-  `;
-
-  console.log('Executing insecure query:', insecureQuery);
-
-  db.get(insecureQuery, (err, row) => {
+  // Parameterised query prevents SQL Injection
+  db.get(`SELECT * FROM users WHERE email = ?`, [email], async (err, user) => {
     if (err) {
-      // INSECURE: exposing error details to the user
-      return res.send(`<p>Database error (insecure): ${err.message}</p>`);
+      console.error('Secure login DB error:', err);
+      return res.send('<p>Something went wrong. Please try again later.</p>');
     }
 
-    if (!row) {
-      return res.send(`
-        <h1>Login failed</h1>
-        <p>Invalid email or password.</p>
-        <p><a href="/login">Try again</a></p>
-      `);
+    if (!user) {
+      return res.send('<p>Invalid email or password. <a href="/login">Try again</a></p>');
     }
 
-    // INSECURE "session" management: global variable
-    currentUser = row;
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) {
+      return res.send('<p>Invalid email or password. <a href="/login">Try again</a></p>');
+    }
+
+    // Store only minimal info in session
+    req.session.user = {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      role: user.role
+    };
 
     res.send(`
-      <h1>Login successful</h1>
-      <p>Welcome, ${row.name}!</p>
-      <p>Your role: ${row.role}</p>
+      <h1>Login successful (Secure)</h1>
+      <p>Welcome, ${escapeHtml(user.name)}!</p>
+      <p>Your role: ${escapeHtml(user.role)}</p>
       <p><a href="/">Go to home</a></p>
     `);
   });
 });
 
-// Simple logout (resets global variable)
+// Logout: destroy session
 app.get('/logout', (req, res) => {
-  currentUser = null;
-  res.redirect('/');
+  req.session.destroy(() => {
+    res.redirect('/');
+  });
 });
 
-// View all posts (Stored + Reflected + DOM-based XSS will appear here)
+// View all posts (XSS mitigated with escaping and safe queries)
 app.get('/posts', (req, res) => {
-  const search = req.query.search || "";
+  const search = req.query.search || '';
+  const params = [];
 
   let query = `SELECT * FROM posts`;
   if (search) {
-    // INSECURE: search is concatenated directly → SQL injection + reflected XSS
-    query += ` WHERE title LIKE '%${search}%' OR content LIKE '%${search}%'`;
+    query += ` WHERE title LIKE ? OR content LIKE ?`;
+    const like = `%${search}%`;
+    params.push(like, like);
   }
   query += ` ORDER BY created_at DESC`;
 
-  db.all(query, (err, posts) => {
-    if (err) return res.send("Database error: " + err.message);
+  db.all(query, params, (err, posts) => {
+    if (err) {
+      console.error('Secure posts DB error:', err);
+      return res.send('<p>Something went wrong loading posts.</p>');
+    }
 
-    let html = `<h1>Insecure Posts</h1>`;
+    const user = res.locals.currentUser;
+    let html = `<h1>Secure Posts</h1>`;
 
-    if (currentUser) {
+    if (user) {
       html += `
         <p><a href="/create-post">Create New Post</a></p>
-        <p>Logged in as: ${currentUser.name} <a href="/logout">Logout</a></p>
+        <p>Logged in as: ${escapeHtml(user.name)} <a href="/logout">Logout</a></p>
       `;
     } else {
       html += `<p><a href="/login">Login first</a></p>`;
     }
 
-    // Search form (Reflected XSS point)
+    // Search form with escaped value
     html += `
       <form method="GET" action="/posts">
-        <input type="text" name="search" value="${search}">
+        <input type="text" name="search" value="${escapeHtml(search)}">
         <button type="submit">Search</button>
       </form>
-      <p>Search term: ${search}</p> <!-- Reflected XSS here -->
     `;
 
     posts.forEach(post => {
       html += `
         <div style="border:1px solid black; padding:10px; margin:10px;">
-          <h3>${post.title}</h3>
-          <p>${post.content}</p> <!-- Stored XSS shows here -->
+          <h3>${escapeHtml(post.title)}</h3>
+          <p>${escapeHtml(post.content)}</p>
         </div>
       `;
     });
-
-    // DOM-based XSS demo – uses location.hash unsafely
-    html += `
-      <div id="dom-xss-output" style="margin-top:20px; padding:10px; border:1px dashed red;">
-        <strong>DOM XSS Output Area</strong>
-      </div>
-      <script>
-        (function() {
-          var hash = window.location.hash.substring(1); // everything after #
-          if (hash) {
-            var el = document.getElementById('dom-xss-output');
-            // INSECURE: direct use of innerHTML with untrusted data
-            el.innerHTML = hash;
-          }
-        })();
-      </script>
-      <p>DOM XSS demo: try visiting this page with a URL fragment, for example:</p>
-      <pre>/posts#&lt;img src=x onerror=alert(3)&gt;</pre>
-    `;
 
     res.send(html);
   });
 });
 
-// Create post form
+// Create post form (includes CSRF token)
 app.get('/create-post', (req, res) => {
-  if (!currentUser) return res.redirect('/login');
+  const user = res.locals.currentUser;
+  if (!user) return res.redirect('/login');
+
+  const token = req.csrfToken();
 
   res.send(`
-    <h1>Create Post</h1>
+    <h1>Create Post (Secure)</h1>
     <form method="POST" action="/create-post">
+      <input type="hidden" name="_csrf" value="${token}">
       <input type="text" name="title" placeholder="Title"><br><br>
       <textarea name="content" placeholder="Content"></textarea><br><br>
       <button type="submit">Submit</button>
     </form>
-    <p>⚠️ Try a Stored XSS attack!</p>
     <p><a href="/posts">Back to posts</a></p>
   `);
 });
 
-// INSECURE: Stored XSS vulnerability here!
+// SECURE: use parameterised INSERT and escape on output
 app.post('/create-post', (req, res) => {
-  if (!currentUser) return res.redirect('/login');
+  const user = res.locals.currentUser;
+  if (!user) return res.redirect('/login');
 
   const { title, content } = req.body;
 
-  const query = `
-    INSERT INTO posts (user_id, title, content)
-    VALUES (${currentUser.id}, '${title}', '${content}')
-  `;
-
-  db.run(query, (err) => {
-    if (err) {
-      console.error("Insert error:", err.message);
+  db.run(
+    `INSERT INTO posts (user_id, title, content) VALUES (?, ?, ?)`,
+    [user.id, title, content],
+    (err) => {
+      if (err) {
+        console.error('Secure insert post error:', err);
+      }
+      res.redirect('/posts');
     }
-    res.redirect('/posts');
-  });
+  );
 });
 
 app.listen(PORT, () => {
-  console.log(`Insecure app listening on http://localhost:${PORT}`);
+  console.log(`Secure app listening on http://localhost:${PORT}`);
 });
