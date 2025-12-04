@@ -1,5 +1,5 @@
 // src/server.js
-// INSECURE Express server – contains SQL Injection vulnerability in /login
+// INSECURE Express server – contains SQL Injection and XSS vulnerabilities
 
 const express = require('express');
 const path = require('path');
@@ -20,6 +20,7 @@ app.get('/', (req, res) => {
     <h1>Insecure Blog - Insecure Branch</h1>
     ${currentUser ? `<p>Logged in as: ${currentUser.name} (${currentUser.email})</p>` : '<p>Not logged in</p>'}
     <p><a href="/login">Login</a></p>
+    <p><a href="/posts">View Posts</a></p>
     <p><a href="/init-db">Initialize DB (for demo)</a></p>
   `;
   res.send(html);
@@ -97,14 +98,19 @@ app.get('/logout', (req, res) => {
   res.redirect('/');
 });
 
-app.listen(PORT, () => {
-  console.log(`Insecure app listening on http://localhost:${PORT}`);
-});
-
-// View all posts (Stored XSS will appear here)
+// View all posts (Stored + Reflected + DOM-based XSS will appear here)
 app.get('/posts', (req, res) => {
-  db.all(`SELECT * FROM posts ORDER BY created_at DESC`, (err, posts) => {
-    if (err) return res.send("Database error");
+  const search = req.query.search || "";
+
+  let query = `SELECT * FROM posts`;
+  if (search) {
+    // INSECURE: search is concatenated directly → SQL injection + reflected XSS
+    query += ` WHERE title LIKE '%${search}%' OR content LIKE '%${search}%'`;
+  }
+  query += ` ORDER BY created_at DESC`;
+
+  db.all(query, (err, posts) => {
+    if (err) return res.send("Database error: " + err.message);
 
     let html = `<h1>Insecure Posts</h1>`;
 
@@ -117,6 +123,15 @@ app.get('/posts', (req, res) => {
       html += `<p><a href="/login">Login first</a></p>`;
     }
 
+    // Search form (Reflected XSS point)
+    html += `
+      <form method="GET" action="/posts">
+        <input type="text" name="search" value="${search}">
+        <button type="submit">Search</button>
+      </form>
+      <p>Search term: ${search}</p> <!-- Reflected XSS here -->
+    `;
+
     posts.forEach(post => {
       html += `
         <div style="border:1px solid black; padding:10px; margin:10px;">
@@ -125,6 +140,25 @@ app.get('/posts', (req, res) => {
         </div>
       `;
     });
+
+    // DOM-based XSS demo – uses location.hash unsafely
+    html += `
+      <div id="dom-xss-output" style="margin-top:20px; padding:10px; border:1px dashed red;">
+        <strong>DOM XSS Output Area</strong>
+      </div>
+      <script>
+        (function() {
+          var hash = window.location.hash.substring(1); // everything after #
+          if (hash) {
+            var el = document.getElementById('dom-xss-output');
+            // INSECURE: direct use of innerHTML with untrusted data
+            el.innerHTML = hash;
+          }
+        })();
+      </script>
+      <p>DOM XSS demo: try visiting this page with a URL fragment, for example:</p>
+      <pre>/posts#&lt;img src=x onerror=alert(3)&gt;</pre>
+    `;
 
     res.send(html);
   });
@@ -157,7 +191,14 @@ app.post('/create-post', (req, res) => {
     VALUES (${currentUser.id}, '${title}', '${content}')
   `;
 
-  db.run(query, () => {
+  db.run(query, (err) => {
+    if (err) {
+      console.error("Insert error:", err.message);
+    }
     res.redirect('/posts');
   });
+});
+
+app.listen(PORT, () => {
+  console.log(`Insecure app listening on http://localhost:${PORT}`);
 });
