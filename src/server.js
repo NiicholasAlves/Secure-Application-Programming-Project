@@ -55,11 +55,74 @@ app.get('/', (req, res) => {
   let html = `
     <h1>Secure Blog - Secure Branch</h1>
     ${user ? `<p>Logged in as: ${escapeHtml(user.name)} (${escapeHtml(user.email)})</p>` : '<p>Not logged in</p>'}
-    <p><a href="/login">Login</a></p>
+    <p><a href="/login">Login</a> | <a href="/register">Register</a></p>
     <p><a href="/posts">View Posts</a></p>
   `;
   res.send(html);
 });
+
+// ========= REGISTER =========
+
+// Register form
+app.get('/register', (req, res) => {
+  const token = req.csrfToken();
+  res.send(`
+    <h1>Register</h1>
+    <form method="POST" action="/register">
+      <input type="hidden" name="_csrf" value="${token}">
+      <label>Name:</label><br>
+      <input type="text" name="name"><br><br>
+      <label>Email:</label><br>
+      <input type="text" name="email"><br><br>
+      <label>Password:</label><br>
+      <input type="password" name="password"><br><br>
+      <button type="submit">Register</button>
+    </form>
+    <p><a href="/login">Already registered? Login</a></p>
+    <p><a href="/">Back to home</a></p>
+  `);
+});
+
+// Register handler – uses bcrypt + parameterised INSERT
+app.post('/register', async (req, res) => {
+  const { name, email, password } = req.body;
+
+  if (!name || !email || !password) {
+    return res.send('<p>All fields are required. <a href="/register">Back</a></p>');
+  }
+
+  try {
+    // Check if email already exists
+    db.get(`SELECT id FROM users WHERE email = ?`, [email], async (err, existing) => {
+      if (err) {
+        console.error('Secure register DB error:', err);
+        return res.send('<p>Something went wrong. Please try again later.</p>');
+      }
+
+      if (existing) {
+        return res.send('<p>Email already registered. <a href="/login">Login</a></p>');
+      }
+
+      const hashed = await bcrypt.hash(password, 10);
+      db.run(
+        `INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, ?)`,
+        [name, email, hashed, 'user'],
+        (insertErr) => {
+          if (insertErr) {
+            console.error('Error inserting new user:', insertErr);
+            return res.send('<p>Could not create account. Please try again later.</p>');
+          }
+          res.send('<p>Registration successful. <a href="/login">Click here to login</a></p>');
+        }
+      );
+    });
+  } catch (err) {
+    console.error('Register error:', err);
+    res.send('<p>Something went wrong. Please try again later.</p>');
+  }
+});
+
+// ========= LOGIN =========
 
 // Login form (includes CSRF token)
 app.get('/login', (req, res) => {
@@ -74,6 +137,7 @@ app.get('/login', (req, res) => {
       <input type="password" name="password"><br><br>
       <button type="submit">Login</button>
     </form>
+    <p><a href="/register">Need an account? Register</a></p>
     <p><a href="/">Back to home</a></p>
   `;
   res.send(html);
@@ -123,6 +187,8 @@ app.get('/logout', (req, res) => {
   });
 });
 
+// ========= POSTS (LIST + SEARCH + DELETE) =========
+
 // View all posts (XSS mitigated with escaping and safe queries)
 app.get('/posts', (req, res) => {
   const search = req.query.search || '';
@@ -167,13 +233,23 @@ app.get('/posts', (req, res) => {
         <div style="border:1px solid black; padding:10px; margin:10px;">
           <h3>${escapeHtml(post.title)}</h3>
           <p>${escapeHtml(post.content)}</p>
-        </div>
       `;
+
+      // Show Delete link only to owner or admin
+      if (user && (user.role === 'admin' || user.id === post.user_id)) {
+        html += `
+          <p><a href="/delete-post/${post.id}">Delete</a></p>
+        `;
+      }
+
+      html += `</div>`;
     });
 
     res.send(html);
   });
 });
+
+// ========= CREATE POST =========
 
 // Create post form (includes CSRF token)
 app.get('/create-post', (req, res) => {
@@ -194,7 +270,7 @@ app.get('/create-post', (req, res) => {
   `);
 });
 
-// SECURE: use parameterised INSERT and escape on output
+// SECURE: use parameterised INSERT
 app.post('/create-post', (req, res) => {
   const user = res.locals.currentUser;
   if (!user) return res.redirect('/login');
@@ -211,6 +287,41 @@ app.post('/create-post', (req, res) => {
       res.redirect('/posts');
     }
   );
+});
+
+// ========= DELETE POST =========
+
+// Simple secure delete: only owner or admin
+app.get('/delete-post/:id', (req, res) => {
+  const user = res.locals.currentUser;
+  const postId = req.params.id;
+
+  if (!user) {
+    return res.send('<p>You must be logged in to delete posts. <a href="/login">Login</a></p>');
+  }
+
+  db.get(`SELECT * FROM posts WHERE id = ?`, [postId], (err, post) => {
+    if (err) {
+      console.error('Secure select post for delete error:', err);
+      return res.send('<p>Something went wrong. Please try again later.</p>');
+    }
+    if (!post) {
+      return res.send('<p>Post not found. <a href="/posts">Back to posts</a></p>');
+    }
+
+    // Only post owner or admin can delete
+    if (user.role !== 'admin' && user.id !== post.user_id) {
+      return res.send('<p>You are not authorised to delete this post.</p>');
+    }
+
+    db.run(`DELETE FROM posts WHERE id = ?`, [postId], (delErr) => {
+      if (delErr) {
+        console.error('Secure delete post error:', delErr);
+        return res.send('<p>Could not delete post. Please try again.</p>');
+      }
+      res.redirect('/posts');
+    });
+  });
 });
 
 app.listen(PORT, () => {
